@@ -5,6 +5,7 @@ import sys
 import re
 
 import addr2line
+from itertools import dropwhile
 from typing import Self
 
 
@@ -41,11 +42,13 @@ def get_command_line_parser():
                         help='Smart trim of long lines to width characters (0=disabled)')
     parser.add_argument('-d', '--direction', choices=['bottom-up', 'top-down'], default='bottom-up',
                         help='Print graph bottom-up (default, callees first) or top-down (callers first)')
-    parser.add_argument('-m', '--minimum', type=int, default=None,
+    parser.add_argument('-m', '--minimum', type=int, dest='tmin', default=0,
                         help='Process only stalls lasting the given time, in milliseconds, or longer')
     parser.add_argument('-b', '--branch-threshold', type=float, default=0.03,
                         help='Drop branches responsible for less than this threshold relative to the previous level, not global. (default 3%%)')
     parser.add_argument('file', nargs='?',
+                        type=argparse.FileType('r'),
+                        default=sys.stdin,
                         help='File containing reactor stall backtraces. Read from stdin if missing.')
     return parser
 
@@ -123,9 +126,15 @@ class Graph:
         # Each node in the tree contains:
         self.count = 0
         self.total = 0
-        self.nodes = {}
+        self.nodes = dict[str, Node]()
         self.tail = Node('')
         self.head = Node('')
+
+    def empty(self):
+        return not self.nodes
+
+    def __bool__(self):
+        return not self.empty()
 
     def process_trace(self, trace: list[str], t: int) -> None:
         # process each backtrace and insert it to the tree
@@ -328,8 +337,6 @@ def print_command_line_options(args):
 
 def main():
     args = get_command_line_parser().parse_args()
-    input = open(args.file) if args.file else sys.stdin
-    count = 0
     comment = re.compile(r'^\s*#')
     pattern = re.compile(r"Reactor stalled for (?P<stall>\d+) ms on shard (?P<shard>\d+).*Backtrace:")
     address_threshold = int(args.address_threshold, 0)
@@ -340,7 +347,7 @@ def main():
         resolver = addr2line.BacktraceResolver(executable=args.executable,
                                                concise=not args.full_function_names)
     graph = Graph(resolver)
-    for s in input:
+    for s in args.file:
         if comment.search(s):
             continue
         # parse log line like:
@@ -348,7 +355,6 @@ def main():
         m = pattern.search(s)
         if not m:
             continue
-        count += 1
         # extract the time in ms
         trace = s[m.span()[1]:].split()
         t = int(m.group("stall"))
@@ -367,19 +373,16 @@ def main():
         #  (inlined by) seastar::reactor::block_notifier(int) at ./build/release/seastar/./seastar/src/core/reactor.cc:1240
         # ?? ??:0
         if address_threshold:
-            for i in range(0, len(trace)):
-                if int(trace[i], 0) >= address_threshold:
-                    while int(trace[i], 0) >= address_threshold:
-                        i += 1
-                    trace = trace[i:]
-                    break
-        tmin = args.minimum or 0
-        if t >= tmin:
+            trace = list(dropwhile(lambda addr: int(addr, 0) >= address_threshold, trace))
+        if t >= args.tmin:
             graph.process_trace(trace, t)
 
     try:
+        if not graph:
+            print("No input data found. Please run `stall-analyser.py --help` for usage instruction")
+            sys.exit()
         print_command_line_options(args)
-        print_stats(tally, tmin)
+        print_stats(tally, args.tmin)
         graph.print_graph(args.direction, args.width, args.branch_threshold)
     except BrokenPipeError:
         pass
